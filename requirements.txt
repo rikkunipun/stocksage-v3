@@ -1,0 +1,11 @@
+smartapi-python
+pyotp
+yfinance
+pandas
+ta
+newsapi-python
+anthropic
+python-telegram-bot==20.7
+apscheduler
+python-dotenv
+requests
