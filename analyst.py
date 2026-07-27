@@ -1,13 +1,16 @@
 import os
 import json
 import anthropic
+import yfinance as yf
+import pandas as pd
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from signal_logger import log_signal
 
 load_dotenv()
 
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 VALID_ACTIONS = {"BUY", "SELL", "HOLD"}
 VALID_CATEGORIES = {
@@ -51,7 +54,56 @@ Rules:
   geopolitical, regulatory, sector_rotation, technical_only, macro_data, company_specific, no_catalyst.
 - reason must cite specific numbers or news. Max 150 characters.
 - Only include stocks from the provided portfolio.
+
+Signal Quality Adjustments:
+- sector_rotation and geopolitical event categories: Add +10 to confidence_score (these are high-conviction macro themes).
+- technical_only signals must meet stricter thresholds:
+  * SELL requires RSI > 75 (not 70) — avoid premature sells in trending markets.
+  * BUY requires RSI < 35 (not 40) — wait for deeper oversold levels.
+
 - Return ONLY the JSON object. Nothing else."""
+
+
+def get_market_trend() -> bool:
+    """
+    Check if Nifty 50 (^NSEI) is in a bull market (price > 50-day MA).
+    Returns True if bullish, False otherwise or on error.
+    """
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=90)  # Fetch ~3 months to compute MA50
+
+        df = yf.download(
+            "^NSEI",
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if df.empty or len(df) < 50:
+            print("WARNING: get_market_trend() — insufficient data for ^NSEI")
+            return False
+
+        # Handle MultiIndex columns (yfinance >=0.2.x)
+        if isinstance(df.columns, pd.MultiIndex):
+            close_series = df["Close"]
+            if isinstance(close_series, pd.DataFrame):
+                close_series = close_series.iloc[:, 0]
+        else:
+            close_series = df["Close"]
+
+        ma50 = close_series.rolling(window=50).mean()
+        current_price = float(close_series.iloc[-1])
+        current_ma50 = float(ma50.iloc[-1])
+
+        is_bullish = current_price > current_ma50
+        print(f"[Market Trend] Nifty50: {current_price:.2f} vs MA50: {current_ma50:.2f} → {'BULLISH' if is_bullish else 'BEARISH'}")
+        return is_bullish
+
+    except Exception as e:
+        print(f"WARNING: get_market_trend() failed — {e}")
+        return False
 
 
 def format_confidence_label(score):
@@ -183,6 +235,9 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
     valid_signals = []
     buy_sell_count = 0
 
+    # Check market trend once for all signals
+    market_is_bullish = get_market_trend()
+
     for sig in data.get("signals", []):
         if not validate_signal(sig, portfolio_symbols):
             print(f"WARNING: Dropped invalid signal — {sig.get('stock_symbol')} / {sig.get('action')}")
@@ -198,6 +253,15 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
         if sig["action"] in ("BUY", "SELL") and sig["confidence_score"] < 40:
             print(f"WARNING: Dropped low-confidence {sig['action']} for {sig['stock_symbol']}")
             continue
+
+        # FIX 1: Trend Filter — suppress SELL on overbought stocks in bull market
+        if sig["action"] == "SELL" and market_is_bullish:
+            ss = sig.get("supporting_signals", {})
+            rsi = ss.get("rsi_14")
+            if rsi and rsi > 70:
+                print(f"[Trend Filter] Converting SELL to HOLD for {sig['stock_symbol']} (RSI={rsi:.1f}, market bullish)")
+                sig["action"] = "HOLD"
+                sig["reason"] = f"Overbought (RSI {rsi:.1f}) but market bullish — wait"
 
         # Normalise confidence label
         sig["confidence_label"] = format_confidence_label(sig["confidence_score"])
