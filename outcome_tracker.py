@@ -1,5 +1,6 @@
 import csv
 import fcntl
+import json
 import os
 import tempfile
 from datetime import date, datetime, timedelta
@@ -27,11 +28,19 @@ SECTOR_TICKER_MAP = {
 
 # ── Price fetching ─────────────────────────────────────────────────────────────
 
-def fetch_closing_price(symbol: str, target_date: date) -> float | None:
+def fetch_closing_price(symbol: str, target_date: date, allow_stale_after_days: int = 10) -> float | None:
     """
-    Return the closing price of symbol (NSE) on or just before target_date.
-    Looks back up to 5 calendar days to handle weekends / holidays.
-    Returns None if unavailable.
+    Return the closing price of symbol (NSE) EXACTLY on target_date.
+
+    target_date is always a trading day (computed via trading_days_from), so an
+    exact bar should exist once the EOD data is published. If it isn't published
+    yet, return None — the row stays pending and is retried on the next run.
+    This replaces the old "last close on or before" fallback, which silently
+    recorded wrong-date prices when run before EOD data landed.
+
+    Escape hatch: if target_date is more than `allow_stale_after_days` calendar
+    days in the past and still has no bar (unscheduled market closure, missing
+    holiday entry), fall back to the last close before it — loudly.
     """
     ns_ticker = symbol if symbol.startswith("^") else f"{symbol}.NS"
     start = target_date - timedelta(days=7)
@@ -56,14 +65,25 @@ def fetch_closing_price(symbol: str, target_date: date) -> float | None:
         else:
             df = df["Close"]
 
-        # Find last available close on or before target_date
         df.index = pd.to_datetime(df.index).date
-        eligible = df[df.index <= target_date]
-        if eligible.empty:
-            return None
 
-        val = eligible.iloc[-1]
-        return round(float(val), 2)
+        exact = df[df.index == target_date]
+        if not exact.empty:
+            return round(float(exact.iloc[-1]), 2)
+
+        # No bar for target_date yet.
+        days_old = (datetime.now(IST).date() - target_date).days
+        if days_old > allow_stale_after_days:
+            eligible = df[df.index < target_date]
+            if not eligible.empty:
+                stale_date = eligible.index[-1]
+                print(
+                    f"WARNING: no bar for {symbol} on {target_date} after {days_old}d — "
+                    f"using stale close from {stale_date}"
+                )
+                return round(float(eligible.iloc[-1]), 2)
+
+        return None
 
     except Exception as e:
         print(f"WARNING: fetch_closing_price({symbol}, {target_date}) failed — {e}")
@@ -141,7 +161,7 @@ def update_signal_outcomes(
     Determine which tracking dates are due, fetch prices, compute returns/alphas,
     and update only the still-empty columns for this signal.
     """
-    elapsed = get_trading_days_elapsed(signal_date, date.today())
+    elapsed = get_trading_days_elapsed(signal_date, datetime.now(IST).date())
     updates = {}
 
     def _get_prices_for_day(n):
@@ -188,35 +208,74 @@ def update_signal_outcomes(
             updates["return_5d_pct"] = calculate_return(action, price_at_signal, stock_p)
             print(f"  [5d] {existing['stock_symbol']} @ {stock_p} on {td} → {updates['return_5d_pct']:+.2f}%")
 
+    # 10-day tracking (matches "5-7 day" / "7-10 day" signal horizons)
+    if elapsed >= 10 and not existing.get("price_10d"):
+        stock_p, _, _, td = _get_prices_for_day(10)
+        if stock_p:
+            updates["price_10d"]      = stock_p
+            updates["return_10d_pct"] = calculate_return(action, price_at_signal, stock_p)
+            print(f"  [10d] {existing['stock_symbol']} @ {stock_p} on {td} → {updates['return_10d_pct']:+.2f}%")
+
+    # 20-day tracking (~1 month; catches slow theses and mean-reversion reversals)
+    if elapsed >= 20 and not existing.get("price_20d"):
+        stock_p, _, _, td = _get_prices_for_day(20)
+        if stock_p:
+            updates["price_20d"]      = stock_p
+            updates["return_20d_pct"] = calculate_return(action, price_at_signal, stock_p)
+            print(f"  [20d] {existing['stock_symbol']} @ {stock_p} on {td} → {updates['return_20d_pct']:+.2f}%")
+
     if updates:
         _atomic_update_row(signal_id, updates)
 
     return updates
 
 
+# ── Heartbeat ──────────────────────────────────────────────────────────────────
+
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "tracker_heartbeat.json")
+
+
+def _write_heartbeat(summary: dict):
+    """Record that the tracker ran. run_briefing.py checks this for staleness."""
+    try:
+        payload = {"last_run": datetime.now(IST).isoformat(), "summary": summary}
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        print(f"WARNING: heartbeat write failed — {e}")
+
+
 # ── Main runner ────────────────────────────────────────────────────────────────
 
 def run_tracking() -> dict:
     """
-    Main function called by scheduler at 4 PM IST.
-    Processes all pending signals and fills in outcome prices.
+    Process all pending signals and fill in outcome prices.
+    Run daily after EOD data publishes (see run_tracking.py entrypoint).
     Returns a summary dict.
     """
-    today = date.today()
+    today = datetime.now(IST).date()
     if not is_trading_day(today):
         print(f"[tracker] {today} is not a trading day — skipping")
-        return {"skipped": True, "reason": "non-trading day"}
+        summary = {"skipped": True, "reason": "non-trading day"}
+        _write_heartbeat(summary)
+        return summary
 
     pending = get_pending_tracking()
     if pending.empty:
         print("[tracker] No pending signals to track")
-        return {"updated": 0, "signals": []}
+        summary = {"updated": 0, "signals": []}
+        _write_heartbeat(summary)
+        return summary
 
     print(f"[tracker] Processing {len(pending)} pending signal(s)...")
     summary = {"updated": 0, "signals": []}
 
     for _, row in pending.iterrows():
         sig_id = row["signal_id"]
+        # Outcomes only make sense for directional calls; HOLD/test rows would
+        # be scored with SELL semantics by calculate_return — skip them.
+        if row.get("action") not in ("BUY", "SELL"):
+            continue
         try:
             signal_date = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").date()
             price_at_signal = float(row["price_at_signal"])
@@ -232,7 +291,7 @@ def run_tracking() -> dict:
                 price_at_signal  = price_at_signal,
                 signal_date      = signal_date,
                 sector_index_name = row.get("sector_index_name", "Nifty 50"),
-                existing         = row.to_dict(),
+                existing         = row.fillna("").to_dict(),
             )
             if updates:
                 summary["updated"] += 1
@@ -242,6 +301,7 @@ def run_tracking() -> dict:
             continue
 
     print(f"\n[tracker] Done. Updated {summary['updated']} signal(s).")
+    _write_heartbeat(summary)
     return summary
 
 

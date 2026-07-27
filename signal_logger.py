@@ -4,16 +4,17 @@ import json
 import fcntl
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from nse_calendar import is_trading_day
 
 DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
 SIGNALS_FILE  = os.path.join(DATA_DIR, "signals_log.csv")
 FAILSAFE_FILE = os.path.join(DATA_DIR, "failsafe.jsonl")
 BACKUPS_DIR   = os.path.join(DATA_DIR, "backups")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -24,7 +25,9 @@ COLUMNS = [
     "source_headlines", "rsi_at_signal", "ma20_position",
     "ma50_position", "nifty50_at_signal", "sector_index_at_signal",
     "sector_index_name", "price_1d", "price_3d", "price_5d",
+    "price_10d", "price_20d",
     "return_1d_pct", "return_3d_pct", "return_5d_pct",
+    "return_10d_pct", "return_20d_pct",
     "nifty50_return_3d_pct", "sector_return_3d_pct",
     "alpha_vs_nifty_3d", "alpha_vs_sector_3d", "schema_version",
 ]
@@ -114,6 +117,49 @@ def _write_failsafe(data: dict):
     print(f"WARNING: Signal saved to failsafe.jsonl — {data.get('signal_id')}")
 
 
+def is_duplicate_signal(symbol: str, action: str, days: int = 3) -> bool:
+    """
+    Check if the same stock + action was logged in the last N trading days.
+    Returns True if duplicate found (should skip logging).
+    """
+    try:
+        df = get_all_signals()
+        if df.empty:
+            return False
+
+        # Filter for same symbol and action
+        mask = (df["stock_symbol"] == symbol) & (df["action"] == action)
+        recent = df[mask].copy()
+
+        if recent.empty:
+            return False
+
+        # Count trading days backward from today
+        today = datetime.now(IST).date()
+        cutoff_date = today
+        trading_days_counted = 0
+
+        while trading_days_counted < days:
+            cutoff_date -= timedelta(days=1)
+            if is_trading_day(cutoff_date):
+                trading_days_counted += 1
+
+        # Parse timestamps and check if any fall within the window
+        for ts_str in recent["timestamp"]:
+            try:
+                sig_date = datetime.strptime(str(ts_str), "%Y-%m-%d %H:%M:%S").date()
+                if sig_date > cutoff_date:
+                    return True
+            except (ValueError, TypeError):
+                continue
+
+        return False
+
+    except Exception as e:
+        print(f"WARNING: is_duplicate_signal() failed — {e}")
+        return False  # On error, allow the signal
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def log_signal(
@@ -132,6 +178,13 @@ def log_signal(
     """
     ts     = _now_ist()
     symbol = signal.get("stock_symbol", "UNKNOWN")
+    action = signal.get("action", "")
+
+    # FIX 2: Skip duplicate signals (same stock + action in last 3 trading days)
+    if is_duplicate_signal(symbol, action, days=3):
+        print(f"[Dedup] Skipping duplicate {action} signal for {symbol} (logged in last 3 trading days)")
+        return f"SKIPPED_{symbol}_{action}"
+
     sig_id = _make_signal_id(symbol, ts)
 
     tech = technicals.get(symbol, {})
@@ -163,9 +216,13 @@ def log_signal(
         "price_1d":                "",
         "price_3d":                "",
         "price_5d":                "",
+        "price_10d":               "",
+        "price_20d":               "",
         "return_1d_pct":           "",
         "return_3d_pct":           "",
         "return_5d_pct":           "",
+        "return_10d_pct":          "",
+        "return_20d_pct":          "",
         "nifty50_return_3d_pct":   "",
         "sector_return_3d_pct":    "",
         "alpha_vs_nifty_3d":       "",
@@ -203,7 +260,7 @@ def get_all_signals() -> pd.DataFrame:
     if not bad_versions.empty:
         raise RuntimeError(
             f"{len(bad_versions)} rows have schema_version != {SCHEMA_VERSION}. "
-            "Run a migration before reading."
+            "Run `python migrate_schema_v4.py` before reading."
         )
 
     return df
@@ -216,9 +273,11 @@ def get_pending_tracking() -> pd.DataFrame:
         return df
 
     mask = (
-        df["price_1d"].isna() | (df["price_1d"] == "") |
-        df["price_3d"].isna() | (df["price_3d"] == "") |
-        df["price_5d"].isna() | (df["price_5d"] == "")
+        df["price_1d"].isna()  | (df["price_1d"] == "")  |
+        df["price_3d"].isna()  | (df["price_3d"] == "")  |
+        df["price_5d"].isna()  | (df["price_5d"] == "")  |
+        df["price_10d"].isna() | (df["price_10d"] == "") |
+        df["price_20d"].isna() | (df["price_20d"] == "")
     )
     return df[mask].reset_index(drop=True)
 

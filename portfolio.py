@@ -1,5 +1,4 @@
 import os
-import sys
 import pyotp
 from SmartApi import SmartConnect
 from dotenv import load_dotenv
@@ -14,38 +13,38 @@ TOTP_SECRET = os.getenv("TOTP_SECRET")
 
 
 def login():
-    """Login to Angel One SmartAPI and return an authenticated SmartConnect instance."""
+    """
+    Login to Angel One SmartAPI and return an authenticated SmartConnect instance.
+    Raises RuntimeError on failure — callers (briefing/bot) catch and alert.
+    Never calls sys.exit: a transient Angel failure must not kill the process
+    or bypass the Telegram failure alert (SystemExit skips `except Exception`).
+    """
     if not all([ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_CLIENT_PASSWORD, TOTP_SECRET]):
-        print("ERROR: Missing one or more Angel One credentials in .env")
-        sys.exit(1)
+        raise RuntimeError("Missing one or more Angel One credentials in .env")
 
     try:
         totp = pyotp.TOTP(TOTP_SECRET).now()
         api = SmartConnect(api_key=ANGEL_API_KEY)
         data = api.generateSession(ANGEL_CLIENT_CODE, ANGEL_CLIENT_PASSWORD, totp)
-
-        if data.get("status") is False:
-            print(f"ERROR: Login failed — {data.get('message', 'unknown error')}")
-            sys.exit(1)
-
-        return api
-
     except Exception as e:
-        print(f"ERROR: Login failed — {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Angel One login failed — {e}") from e
+
+    if data.get("status") is False:
+        raise RuntimeError(f"Angel One login failed — {data.get('message', 'unknown error')}")
+
+    return api
 
 
 def get_holdings(api):
-    """Fetch portfolio holdings and return a clean list of dicts."""
+    """Fetch portfolio holdings and return a clean list of dicts. Raises RuntimeError on failure."""
     try:
         response = api.holding()
     except Exception as e:
-        print(f"ERROR: Failed to fetch holdings — {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Failed to fetch holdings — {e}") from e
 
     if not response or response.get("status") is False:
-        print(f"ERROR: Could not retrieve holdings — {response.get('message', 'unknown error')}")
-        sys.exit(1)
+        msg = response.get("message", "unknown error") if response else "empty response"
+        raise RuntimeError(f"Could not retrieve holdings — {msg}")
 
     raw_holdings = response.get("data") or []
     holdings = []
