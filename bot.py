@@ -69,8 +69,11 @@ def _format_signal_block(signal, technicals):
 
     action_icon = "🟢 BUY" if signal["action"] == "BUY" else "🔴 SELL"
 
+    # Confidence deliberately not shown: calibration (Jul 2026) found scores
+    # anti-correlated with outcomes (-0.33). Still logged for calibration;
+    # restore display once item-5 calibration makes the number meaningful.
     lines = [
-        f"<b>{action_icon} {_e(sym)}</b> | Confidence: {_e(signal['confidence_score'])}/100 ({_e(signal['confidence_label'])})",
+        f"<b>{action_icon} {_e(sym)}</b>",
         f"Reason: {_e(signal['reason'])}",
         f"Event: {_e(signal['event_category'])} | Horizon: {_e(signal['time_horizon'])}",
         f"Price: ₹{_e(price)} | Sector: {_e(sector_name)} @ {_e(sector_price)}",

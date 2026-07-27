@@ -56,7 +56,8 @@ Rules:
 - Only include stocks from the provided portfolio.
 
 Signal Quality Adjustments:
-- sector_rotation and geopolitical event categories: Add +10 to confidence_score (these are high-conviction macro themes).
+- confidence_score must reflect your honest probability the call is right. Never
+  inflate it for any category; report genuine uncertainty as a low score.
 - technical_only signals must meet stricter thresholds:
   * SELL requires RSI > 75 (not 70) — avoid premature sells in trending markets.
   * BUY requires RSI < 35 (not 40) — wait for deeper oversold levels.
@@ -246,6 +247,7 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
 
     # Validate and fix confidence labels
     valid_signals = []
+    suppressed_sells = []
     buy_sell_count = 0
 
     # Check market trend once for all signals
@@ -255,6 +257,17 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
         if not validate_signal(sig, portfolio_symbols):
             print(f"WARNING: Dropped invalid signal — {sig.get('stock_symbol')} / {sig.get('action')}")
             continue
+
+        # INTERIM POLICY (calibration, Jul 2026): technical_only SELLs hit 5.9%
+        # at 3d and cost -6.9% avg at 20d across Apr-May signals — suppress them
+        # until signals are grounded in real data. The original SELL is shadow-
+        # logged (event_type="suppressed") so the tracker keeps scoring what the
+        # engine WOULD have said; re-enable only when that record turns positive.
+        if sig["action"] == "SELL" and sig.get("event_category") == "technical_only":
+            suppressed_sells.append(dict(sig))  # copy before demotion
+            print(f"[Interim Filter] Demoting technical_only SELL → HOLD for {sig['stock_symbol']}")
+            sig["action"] = "HOLD"
+            sig["reason"] = f"SELL suppressed pending validation — {sig['reason']}"[:150]
 
         # Enforce max 3 BUY/SELL
         if sig["action"] in ("BUY", "SELL"):
@@ -303,6 +316,28 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
                 print(f"WARNING: Failed to log signal for {sym} — {e}")
 
     data["signal_ids"] = signal_ids
+
+    # Shadow-log suppressed SELLs (never sent to Telegram; scored by the
+    # outcome tracker under event_type="suppressed" for calibration).
+    suppressed_ids = []
+    for sig in suppressed_sells:
+        sym  = sig["stock_symbol"]
+        tech = technicals.get(sym, {})
+        try:
+            sid = log_signal(
+                signal       = sig,
+                technicals   = technicals,
+                nifty_price  = tech.get("nifty50_price"),
+                sector_price = tech.get("sector_index_price"),
+                sector_name  = tech.get("sector_index_name", ""),
+                headlines    = news[:3],
+                event_type   = "suppressed",
+            )
+            suppressed_ids.append(sid)
+        except Exception as e:
+            print(f"WARNING: Failed to shadow-log suppressed SELL for {sym} — {e}")
+    data["suppressed_signal_ids"] = suppressed_ids
+
     return data
 
 
