@@ -152,19 +152,28 @@ def _build_user_prompt(holdings, news, technicals):
         )
 
     lines.append("\n=== TECHNICAL INDICATORS ===")
-    for sym, t in technicals.items():
-        rsi = t.get("rsi_14", "N/A")
+    if technicals:
+        for sym, t in technicals.items():
+            lines.append(
+                f"{sym} | price={t.get('current_price', 'N/A')} | RSI={t.get('rsi_14', 'N/A')} "
+                f"| MA20={t.get('ma20', 'N/A')} ({t.get('ma20_position', 'unknown')}) "
+                f"| MA50={t.get('ma50', 'N/A')} ({t.get('ma50_position', 'unknown')}) "
+                f"| sector={t.get('sector_index_name', 'N/A')}@{t.get('sector_index_price', 'N/A')}"
+            )
+        nifty = next(iter(technicals.values())).get("nifty50_price")
+        lines.append(f"Nifty 50: {nifty if nifty is not None else 'unavailable'}")
+    else:
         lines.append(
-            f"{sym} | price={t['current_price']} | RSI={rsi} "
-            f"| MA20={t['ma20']} ({t['ma20_position']}) "
-            f"| MA50={t['ma50']} ({t['ma50_position']}) "
-            f"| sector={t['sector_index_name']}@{t['sector_index_price']}"
+            "Technical data unavailable this run. Do NOT infer or invent indicator "
+            "values; only technical_only signals are impossible today."
         )
-    lines.append(f"Nifty 50: {next(iter(technicals.values()))['nifty50_price']}")
 
     lines.append("\n=== RECENT MARKET NEWS ===")
-    for i, n in enumerate(news[:10], 1):
-        lines.append(f"[{i}] {n['title']} ({n['source']}, {n['published_at'][:10]})")
+    if news:
+        for i, n in enumerate(news[:10], 1):
+            lines.append(f"[{i}] {n['title']} ({n['source']}, {n['published_at'][:10]})")
+    else:
+        lines.append("No headlines available this run. Do NOT cite or invent news.")
 
     lines.append(
         "\nBased on the above data, generate trading signals for this portfolio. "
@@ -179,7 +188,7 @@ def _call_claude(user_prompt):
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=2048,  # 1024 risked mid-JSON truncation on a 25+ holding portfolio
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
@@ -212,6 +221,10 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
     if not CLAUDE_API_KEY:
         print("ERROR: CLAUDE_API_KEY not set")
         return _fallback("CLAUDE_API_KEY missing")
+
+    if not holdings:
+        print("WARNING: no holdings — skipping analysis")
+        return _fallback("no holdings returned by Angel One")
 
     portfolio_symbols = {h["symbol"].split("-")[0] for h in holdings}
     user_prompt = _build_user_prompt(holdings, news, technicals)

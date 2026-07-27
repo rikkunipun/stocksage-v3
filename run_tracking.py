@@ -31,8 +31,11 @@ async def main():
     from briefing_sender import send_error_alert
     try:
         from outcome_tracker import run_tracking
+        from signal_logger import create_daily_backup
         summary = run_tracking()
         log.info(f"Tracking complete: {summary}")
+        backup = create_daily_backup()
+        log.info(f"Daily CSV backup: {backup}")
     except Exception as e:
         log.error("Outcome tracking failed:\n" + traceback.format_exc())
         try:

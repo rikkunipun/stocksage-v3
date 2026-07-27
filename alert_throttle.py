@@ -33,20 +33,54 @@ def _now_ist() -> datetime:
     return datetime.now(IST)
 
 
+def _maybe_reset(state: dict) -> bool:
+    """
+    Lazy time-based resets: no external scheduler required.
+    Resets hourly_count when the wall-clock hour has rolled over since the
+    last reset, and daily_count + seen_headlines when the date has.
+    Returns True if the state was modified.
+    """
+    changed = False
+    now = _now_ist()
+
+    last_hour = state.get("last_reset_hour")
+    try:
+        last_hour_dt = datetime.fromisoformat(last_hour) if last_hour else None
+    except (ValueError, TypeError):
+        last_hour_dt = None
+    hour_floor = now.replace(minute=0, second=0, microsecond=0)
+    if last_hour_dt is None or last_hour_dt < hour_floor:
+        state["hourly_count"] = 0
+        state["last_reset_hour"] = now.isoformat()
+        changed = True
+
+    if state.get("last_reset_date") != now.date().isoformat():
+        state["daily_count"] = 0
+        state["seen_headlines"] = []
+        state["last_reset_date"] = now.date().isoformat()
+        changed = True
+
+    return changed
+
+
 def _load_state() -> dict:
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(STATE_FILE):
-        return dict(_DEFAULT_STATE)
-    try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        # Fill any missing keys from defaults
-        for k, v in _DEFAULT_STATE.items():
-            state.setdefault(k, v)
-        return state
-    except Exception as e:
-        print(f"WARNING: Could not load throttle_state.json — {e}. Using defaults.")
-        return dict(_DEFAULT_STATE)
+        state = dict(_DEFAULT_STATE)
+    else:
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            # Fill any missing keys from defaults
+            for k, v in _DEFAULT_STATE.items():
+                state.setdefault(k, v)
+        except Exception as e:
+            print(f"WARNING: Could not load throttle_state.json — {e}. Using defaults.")
+            state = dict(_DEFAULT_STATE)
+
+    if _maybe_reset(state):
+        _save_state(state)
+    return state
 
 
 def _save_state(state: dict):
@@ -81,6 +115,12 @@ def _is_duplicate(headline: str, seen: list) -> bool:
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
+def is_seen(headline: str) -> bool:
+    """True if headline is a (near-)duplicate of one already alerted on today."""
+    state = _load_state()
+    return _is_duplicate(headline, state["seen_headlines"])
+
 
 def can_send_alert(headline: str, severity_score: int) -> bool:
     """

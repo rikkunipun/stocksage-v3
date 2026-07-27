@@ -17,7 +17,10 @@ from news_feed import get_news
 from technicals import get_all_technicals
 from analyst import analyze_portfolio
 from nse_calendar import is_market_open, is_trading_day
-from alert_throttle import can_send_alert, record_alert_sent, is_muted as throttle_is_muted
+from alert_throttle import (
+    can_send_alert, record_alert_sent, is_muted as throttle_is_muted,
+    set_mute, clear_mute, is_seen, get_status as throttle_status,
+)
 
 load_dotenv()
 
@@ -190,25 +193,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     last = _state["last_run"].strftime("%d %b %Y %H:%M IST") if _state["last_run"] else "Never"
-    mute_str = (
-        f"Active until {_state['muted_until'].strftime('%H:%M IST')}"
-        if _is_muted() else "Inactive"
-    )
-
-    # Light connectivity checks
-    angel_ok  = "✅ Connected"
-    news_ok   = "✅ Connected"
-    claude_ok = "✅ Connected" if os.getenv("CLAUDE_API_KEY") else "❌ Key missing"
+    ts = throttle_status()  # persisted mute + alert budget (source of truth for geo alerts)
+    claude_ok = "✅ Key present" if os.getenv("CLAUDE_API_KEY") else "❌ Key missing"
 
     text = (
         f"<b>STOCKSAGE STATUS</b>\n"
         f"{DIVIDER}\n"
         f"Last run: {_e(last)}\n"
-        f"Angel One: {angel_ok}\n"
-        f"NewsAPI: {news_ok}\n"
         f"Claude API: {claude_ok}\n"
         f"Signals today: {_state['signals_today']}\n"
-        f"Mute status: {_e(mute_str)}"
+        f"Geo-alert mute: {_e(ts['mute_status'])}\n"
+        f"Alert budget: {ts['hourly_remaining']}/hr, {ts['daily_remaining']}/day remaining"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -222,18 +217,18 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /mute N  (N = number of hours)")
         return
 
+    # Set BOTH mute layers: bot _state gates briefing sends (send_signal_message);
+    # alert_throttle's persisted mute is what geo_alert_loop actually checks.
     _state["muted_until"] = _now_ist() + timedelta(hours=hours)
-    await update.message.reply_text(
-        f"🔇 Geo-alerts muted for {hours} hour(s). "
-        f"Resumes at {_state['muted_until'].strftime('%H:%M IST')}."
-    )
+    msg = set_mute(hours)
+    await update.message.reply_text(msg)
 
 
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorised(update):
         return
     _state["muted_until"] = None
-    await update.message.reply_text("🔔 Geo-alerts resumed.")
+    await update.message.reply_text(clear_mute())
 
 
 # ── Geo-alert loop (called every 15 min by agent_core.py) ──────────────────────
@@ -241,9 +236,10 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
 _HAIKU_MODEL      = "claude-haiku-4-5-20251001"
 _SEVERITY_PROMPT  = (
-    "Rate the market impact of this news headline on Indian stock markets (NSE/BSE). "
-    "Respond with ONLY a valid JSON object, no explanation, no markdown. "
-    'Example format: {"severity_score": 75, "affected_sectors": ["Banking", "IT"]}. '
+    "You rate news headlines for market impact on Indian stock markets (NSE/BSE). "
+    "The user message contains numbered headlines. Respond with ONLY a valid JSON "
+    "array, no explanation, no markdown fences — one object per headline, same order: "
+    '[{"index": 1, "severity_score": 75, "affected_sectors": ["Banking", "IT"]}, ...]. '
     "severity_score is an integer 0-100 where 0=irrelevant, 100=extreme market impact."
 )
 
@@ -257,24 +253,43 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def _score_headline(title: str) -> tuple[int, list]:
-    """Call Claude Haiku to score a headline. Returns (severity_score, affected_sectors)."""
-    if not _CLAUDE_API_KEY:
-        return 0, []
+def _score_headlines(titles: list) -> dict:
+    """
+    Score all headlines in ONE Haiku call (was one call per headline).
+    Returns {list_index: (severity_score, affected_sectors)}; missing indices
+    mean the model skipped them — treated as severity 0 by the caller.
+    """
+    if not _CLAUDE_API_KEY or not titles:
+        return {}
+    user_msg = "\n".join(f"[{i}] {t}" for i, t in enumerate(titles, 1))
     try:
         client = anthropic.Anthropic(api_key=_CLAUDE_API_KEY)
         msg = client.messages.create(
             model=_HAIKU_MODEL,
-            max_tokens=128,
+            max_tokens=1024,
             system=_SEVERITY_PROMPT,
-            messages=[{"role": "user", "content": title}],
+            messages=[{"role": "user", "content": user_msg}],
         )
-        raw = _strip_fences(msg.content[0].text)
-        data = _json.loads(raw)
-        return int(data.get("severity_score", 0)), data.get("affected_sectors", [])
+        data = _json.loads(_strip_fences(msg.content[0].text))
+        scores = {}
+        for item in data if isinstance(data, list) else []:
+            try:
+                idx = int(item.get("index", 0)) - 1
+                if 0 <= idx < len(titles):
+                    scores[idx] = (
+                        int(item.get("severity_score", 0)),
+                        item.get("affected_sectors") or [],
+                    )
+            except (ValueError, TypeError):
+                continue
+        return scores
     except Exception as e:
-        print(f"WARNING: Haiku scoring failed for '{title[:50]}' — {e}")
-        return 0, []
+        print(f"WARNING: Haiku batch scoring failed — {e}")
+        return {}
+
+
+# Process-lifetime cache of {title: (severity, sectors)} — see geo_alert_loop.
+_score_cache: dict = {}
 
 
 def _format_geo_alert(title: str, severity: int, sectors: list) -> str:
@@ -291,9 +306,9 @@ def _format_geo_alert(title: str, severity: int, sectors: list) -> str:
 
 async def geo_alert_loop(app: Application):
     """
-    Fetch latest news, score each headline with Haiku,
+    Fetch latest news, batch-score UNSEEN headlines with one Haiku call,
     and send geo-alerts that pass the throttle check.
-    Called every 15 minutes by agent_core.py scheduler.
+    Scheduled every 15 minutes on the bot's own JobQueue (see main()).
     """
     if throttle_is_muted():
         return
@@ -304,12 +319,26 @@ async def geo_alert_loop(app: Application):
         print(f"[geo_alert] News fetch failed — {e}")
         return
 
-    for h in headlines:
-        title = h.get("title", "")
-        if not title:
-            continue
+    # Skip headlines already alerted on — previously these were re-scored
+    # every 15 minutes forever, wasting ~90% of Haiku calls.
+    fresh = [h for h in headlines if h.get("title") and not is_seen(h["title"])]
+    if not fresh:
+        return
 
-        severity, sectors = _score_headline(title)
+    # Score only titles we haven't scored this process lifetime; cached scores
+    # let throttled-but-severe headlines retry next cycle without a re-score.
+    to_score = [h["title"] for h in fresh if h["title"] not in _score_cache]
+    if to_score:
+        for idx, result in _score_headlines(to_score).items():
+            _score_cache[to_score[idx]] = result
+        for t in to_score:
+            _score_cache.setdefault(t, (0, []))  # model skipped it → severity 0
+        while len(_score_cache) > 500:
+            _score_cache.pop(next(iter(_score_cache)))
+
+    for h in fresh:
+        title = h["title"]
+        severity, sectors = _score_cache.get(title, (0, []))
 
         if not can_send_alert(title, severity):
             continue
@@ -357,10 +386,20 @@ async def send_signal_message(app: Application, signals_dict: dict, technicals: 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
+async def _job_geo_alert(context: ContextTypes.DEFAULT_TYPE):
+    await geo_alert_loop(context.application)
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set in .env")
         return
+
+    missing = [k for k in ("CLAUDE_API_KEY", "TELEGRAM_CHAT_ID", "NEWSAPI_KEY",
+                           "ANGEL_API_KEY", "ANGEL_CLIENT_CODE", "TOTP_SECRET")
+               if not os.getenv(k)]
+    if missing:
+        print(f"WARNING: missing env keys: {', '.join(missing)} — some features will fail")
 
     app = (
         Application.builder()
@@ -374,6 +413,22 @@ def main():
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("mute",     cmd_mute))
     app.add_handler(CommandHandler("unmute",   cmd_unmute))
+
+    # Geo-alert loop runs on THIS process's JobQueue — bot.py is the sole
+    # long-running entry point (agent_core.py is retired).
+    if app.job_queue is None:
+        print(
+            "WARNING: JobQueue unavailable — geo alerts DISABLED. "
+            'Install with: pip install "python-telegram-bot[job-queue]==20.7"'
+        )
+    else:
+        app.job_queue.run_repeating(
+            _job_geo_alert,
+            interval=timedelta(minutes=15),
+            first=timedelta(seconds=30),
+            name="geo_alert_loop",
+        )
+        print("Geo-alert loop scheduled: every 15 min")
 
     print("StockSage bot started. Polling for commands…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
