@@ -34,6 +34,7 @@ def _tracker_staleness_warning() -> str:
 async def main(dry_run=False):
     from portfolio import fetch_portfolio
     from news_feed import get_news
+    from market_data import get_market_news
     from technicals import get_all_technicals
     from analyst import analyze_portfolio
     from bot import build_signal_message
@@ -42,7 +43,7 @@ async def main(dry_run=False):
     log.info("=== StockSage Manual Briefing ===")
     try:
         holdings   = fetch_portfolio()
-        news       = get_news()
+        news       = get_market_news() or get_news()   # Marketaux primary, GDELT/NewsAPI fallback
         technicals = get_all_technicals([h["symbol"] for h in holdings])
         result     = analyze_portfolio(holdings, news, technicals, event_type="morning_briefing")
         message    = build_signal_message(result, technicals) + _tracker_staleness_warning()

@@ -55,6 +55,22 @@ Rules:
 - reason must cite specific numbers or news. Max 150 characters.
 - Only include stocks from the provided portfolio.
 
+GROUNDING — read carefully:
+- You may ONLY cite facts that appear in the data provided below (technicals,
+  the STOCK NEWS section, the EARNINGS section, market news). If a data point
+  was not given to you, you do not know it.
+- NEVER invent or assume: analyst calls, brokerage recommendations, price
+  targets, fundamentals (P/E, ROE, growth, "strong/weak fundamentals"), or news
+  events. If no news is listed for a stock, treat it as having no known news —
+  do not supply any.
+- Do not name a source (e.g. a newspaper or brokerage) unless that exact source
+  appears in the provided headlines.
+- If a stock has an earnings date within 5 days, do not issue a technical BUY or
+  SELL on it — say HOLD (results pending) instead; a technical thesis can be
+  invalidated overnight by the result.
+- news_sentiment must reflect the provided per-stock headlines/sentiment; if
+  there are none, use "neutral".
+
 Signal Quality Adjustments:
 - confidence_score must reflect your honest probability the call is right. Never
   inflate it for any category; report genuine uncertainty as a low score.
@@ -143,8 +159,16 @@ def validate_signal(signal, portfolio_symbols):
     return True
 
 
-def _build_user_prompt(holdings, news, technicals):
-    """Assemble the user message from the three data sources."""
+def _build_user_prompt(holdings, news, technicals, stock_news=None, earnings=None):
+    """
+    Assemble the user message. stock_news = {symbol: [headlines]} and
+    earnings = {symbol: {next_earnings, days_until, source}} are optional
+    grounding data (item 3); when absent the sections say so explicitly so the
+    model doesn't fill the gap from priors.
+    """
+    stock_news = stock_news or {}
+    earnings   = earnings or {}
+
     lines = ["=== PORTFOLIO HOLDINGS ==="]
     for h in holdings:
         lines.append(
@@ -169,16 +193,42 @@ def _build_user_prompt(holdings, news, technicals):
             "values; only technical_only signals are impossible today."
         )
 
-    lines.append("\n=== RECENT MARKET NEWS ===")
+    # Per-stock news + earnings — the grounding sections (item 3).
+    lines.append("\n=== EARNINGS CALENDAR (next scheduled results) ===")
+    earn_lines = []
+    for sym in {h["symbol"].split("-")[0] for h in holdings}:
+        e = earnings.get(sym)
+        if e and e.get("source") != "none" and e.get("next_earnings"):
+            within5 = e.get("days_until") is not None and e["days_until"] <= 5
+            flag = "  <-- WITHIN 5 DAYS: HOLD, do not issue technical signal" if within5 else ""
+            earn_lines.append(f"{sym}: {e['next_earnings']} (in {e['days_until']}d){flag}")
+    lines += earn_lines if earn_lines else ["No confirmed earnings dates available (treat as unknown)."]
+
+    lines.append("\n=== STOCK-SPECIFIC NEWS (last 7 days; cite ONLY these) ===")
+    any_news = False
+    for sym in {h["symbol"].split("-")[0] for h in holdings}:
+        hl = stock_news.get(sym) or []
+        if not hl:
+            continue
+        any_news = True
+        lines.append(f"[{sym}]")
+        for n in hl[:3]:
+            sent = n.get("sentiment")
+            sent_s = f", sentiment={sent:+.2f}" if isinstance(sent, (int, float)) else ""
+            lines.append(f"  - {n['title']} ({n.get('source','?')}, {n.get('published_at','')[:10]}{sent_s})")
+    if not any_news:
+        lines.append("No stock-specific news retrieved. Treat every stock as having no known news.")
+
+    lines.append("\n=== MARKET / MACRO NEWS ===")
     if news:
-        for i, n in enumerate(news[:10], 1):
-            lines.append(f"[{i}] {n['title']} ({n['source']}, {n['published_at'][:10]})")
+        for i, n in enumerate(news[:8], 1):
+            lines.append(f"[{i}] {n['title']} ({n.get('source','?')}, {n.get('published_at','')[:10]})")
     else:
-        lines.append("No headlines available this run. Do NOT cite or invent news.")
+        lines.append("No market headlines available this run. Do NOT cite or invent news.")
 
     lines.append(
-        "\nBased on the above data, generate trading signals for this portfolio. "
-        "Follow the JSON schema exactly."
+        "\nBased ONLY on the data above, generate trading signals for this portfolio. "
+        "Every claim in every 'reason' must trace to a line above. Follow the JSON schema exactly."
     )
 
     return "\n".join(lines)
@@ -228,7 +278,20 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
         return _fallback("no holdings returned by Angel One")
 
     portfolio_symbols = {h["symbol"].split("-")[0] for h in holdings}
-    user_prompt = _build_user_prompt(holdings, news, technicals)
+
+    # Item 3 grounding: per-stock news + earnings dates. Best-effort — if the
+    # data layer is down the prompt sections say so and the model is told to
+    # treat absence as "no known news", never to invent (the C4/DUMMY_F fix).
+    stock_news, earnings = {}, {}
+    try:
+        from market_data import get_portfolio_news, get_earnings_calendar
+        symbols = list(portfolio_symbols)
+        stock_news = get_portfolio_news(symbols)
+        earnings   = {s: get_earnings_calendar(s) for s in symbols}
+    except Exception as e:
+        print(f"WARNING: grounding data fetch failed — {e} (proceeding without it)")
+
+    user_prompt = _build_user_prompt(holdings, news, technicals, stock_news, earnings)
 
     raw = None
     for attempt in range(1, 3):

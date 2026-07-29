@@ -14,6 +14,7 @@ import json as _json
 
 from portfolio import fetch_portfolio
 from news_feed import get_news
+from market_data import get_market_news
 from technicals import get_all_technicals
 from analyst import analyze_portfolio
 from nse_calendar import is_market_open, is_trading_day
@@ -138,7 +139,7 @@ async def _run_analysis(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label:
 
     try:
         holdings   = fetch_portfolio()
-        news       = get_news()
+        news       = get_market_news() or get_news()   # Marketaux primary, GDELT/NewsAPI fallback
         symbols    = [h["symbol"] for h in holdings]
         technicals = get_all_technicals(symbols)
         result     = analyze_portfolio(holdings, news, technicals, event_type=event_type)
