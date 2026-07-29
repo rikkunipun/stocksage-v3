@@ -8,8 +8,13 @@
 # them out, and never deploy by hand-typing rsync again.
 #
 # Usage:
-#   ./deploy.sh            # sync code, then restart the service
-#   ./deploy.sh --dry-run  # show exactly what WOULD sync, change nothing
+#   ./deploy.sh              # sync code, then restart the service
+#   ./deploy.sh --dry-run    # show exactly what WOULD sync, change nothing
+#   ./deploy.sh --no-restart # sync code but do NOT restart (run a schema
+#                            #   migration on the server first, then restart
+#                            #   manually). Required whenever this deploy bumps
+#                            #   the CSV schema — a restart against an un-migrated
+#                            #   file crash-loops the service on the header check.
 #
 set -euo pipefail
 
@@ -18,8 +23,11 @@ HOST="${STOCKSAGE_HOST:-ubuntu@140.245.243.246}"
 REMOTE_DIR="${STOCKSAGE_REMOTE_DIR:-~/stocksage/}"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)/"
 
-DRY=""
-[[ "${1:-}" == "--dry-run" ]] && DRY="--dry-run"
+DRY=""; RESTART=1
+case "${1:-}" in
+  --dry-run)    DRY="--dry-run" ;;
+  --no-restart) RESTART=0 ;;
+esac
 
 # NEVER remove a --exclude below. data/ is the live datastore; .env holds
 # secrets; logs/venv/pycache are host-side. --delete is deliberately NOT used
@@ -40,6 +48,16 @@ rsync -avz $DRY \
 if [[ -n "$DRY" ]]; then
   echo
   echo "[dry-run] Nothing was changed. Remove --dry-run to deploy."
+  exit 0
+fi
+
+if [[ "$RESTART" -eq 0 ]]; then
+  echo
+  echo "Code synced. Service NOT restarted (--no-restart)."
+  echo "Next: run migrations on the server, then restart, e.g.:"
+  echo "  ssh -i $KEY $HOST 'cd ~/stocksage && python3 migrate_schema.py'"
+  echo "  ssh -i $KEY $HOST 'cd ~/stocksage && venv/bin/python run_briefing.py --dry-run'"
+  echo "  ssh -i $KEY $HOST 'sudo systemctl restart stocksage'"
   exit 0
 fi
 
