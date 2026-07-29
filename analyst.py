@@ -22,6 +22,24 @@ VALID_CATEGORIES = {
     "technical_only", "macro_data", "company_specific", "no_catalyst",
 }
 
+# INTERIM SELL POLICY (calibration, Jul 2026): catalyst-less SELLs are toxic —
+# technical_only SELLs hit 21% at 20d with -2.5% alpha vs Nifty (n=72), while
+# genuinely catalyst-driven SELLs were ~flat (n=7). A SELL is allowed ONLY if it
+# names a real catalyst below. Everything else — technical_only, no_catalyst, an
+# invalid/blank category, or any future relabel of the same momentum-reversal
+# pattern — is suppressed by default. This is an ALLOWLIST on purpose: the bug it
+# replaces was a blocklist that checked the literal "technical_only" and went
+# blind the moment the model relabeled the identical pattern "no_catalyst".
+CATALYST_SELL_CATEGORIES = {
+    "earnings_surprise", "commodity_shock", "rate_decision", "geopolitical",
+    "regulatory", "sector_rotation", "macro_data", "company_specific",
+}
+
+
+def _is_suppressed_sell(action: str, category: str) -> bool:
+    """True if this SELL is catalyst-less and must be demoted to HOLD (interim policy)."""
+    return action == "SELL" and category not in CATALYST_SELL_CATEGORIES
+
 SYSTEM_PROMPT = """You are StockSage, an AI stock market analyst for NSE (Indian stock market).
 
 Your ONLY output is a single valid JSON object. No preamble, no explanation, no markdown fences.
@@ -324,14 +342,12 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
             print(f"WARNING: Dropped invalid signal — {sig.get('stock_symbol')} / {sig.get('action')}")
             continue
 
-        # INTERIM POLICY (calibration, Jul 2026): technical_only SELLs hit 5.9%
-        # at 3d and cost -6.9% avg at 20d across Apr-May signals — suppress them
-        # until signals are grounded in real data. The original SELL is shadow-
-        # logged (event_type="suppressed") so the tracker keeps scoring what the
-        # engine WOULD have said; re-enable only when that record turns positive.
-        if sig["action"] == "SELL" and sig.get("event_category") == "technical_only":
+        # INTERIM POLICY: suppress catalyst-less SELLs (see CATALYST_SELL_CATEGORIES).
+        # The original SELL is shadow-logged (event_type="suppressed") so the tracker
+        # keeps scoring what the engine WOULD have said; re-enable when that turns positive.
+        if _is_suppressed_sell(sig["action"], sig.get("event_category", "")):
             suppressed_sells.append(dict(sig))  # copy before demotion
-            print(f"[Interim Filter] Demoting technical_only SELL → HOLD for {sig['stock_symbol']}")
+            print(f"[Interim Filter] Demoting catalyst-less SELL ({sig.get('event_category')}) → HOLD for {sig['stock_symbol']}")
             sig["action"] = "HOLD"
             sig["reason"] = f"SELL suppressed pending validation — {sig['reason']}"[:150]
 
@@ -617,10 +633,10 @@ def analyze_portfolio_v2(holdings, market_news, technicals, event_type="on_deman
         if d.get("event_category") not in VALID_CATEGORIES:
             d["event_category"] = "no_catalyst"
 
-        # Interim policy: suppress technical_only SELLs (shadow-log for calibration).
-        if d["action"] == "SELL" and d["event_category"] == "technical_only":
+        # Interim policy: suppress catalyst-less SELLs (allowlist, shadow-log for calibration).
+        if _is_suppressed_sell(d["action"], d["event_category"]):
             suppressed.append(dict(d))
-            print(f"[Interim Filter] Demoting technical_only SELL → HOLD for {sym}")
+            print(f"[Interim Filter] Demoting catalyst-less SELL ({d['event_category']}) → HOLD for {sym}")
             d["action"] = "HOLD"
             d["reason"] = f"SELL suppressed pending validation — {d['reason']}"[:180]
 
