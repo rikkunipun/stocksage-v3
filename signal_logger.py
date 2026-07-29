@@ -14,7 +14,7 @@ DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
 SIGNALS_FILE  = os.path.join(DATA_DIR, "signals_log.csv")
 FAILSAFE_FILE = os.path.join(DATA_DIR, "failsafe.jsonl")
 BACKUPS_DIR   = os.path.join(DATA_DIR, "backups")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -24,7 +24,10 @@ COLUMNS = [
     "time_horizon", "reason", "event_category", "event_type",
     "source_headlines", "rsi_at_signal", "ma20_position",
     "ma50_position", "nifty50_at_signal", "sector_index_at_signal",
-    "sector_index_name", "price_1d", "price_3d", "price_5d",
+    "sector_index_name",
+    # v5: actionable levels + falsifiable invalidation (item 4)
+    "entry_price", "stop_loss", "target_price", "invalidation",
+    "price_1d", "price_3d", "price_5d",
     "price_10d", "price_20d",
     "return_1d_pct", "return_3d_pct", "return_5d_pct",
     "return_10d_pct", "return_20d_pct",
@@ -212,6 +215,11 @@ def log_signal(
         "nifty50_at_signal":       nifty_price if nifty_price is not None else "",
         "sector_index_at_signal":  sector_price if sector_price is not None else "",
         "sector_index_name":       sector_name,
+        # v5 actionable levels (item 4) — "" when absent (HOLDs, older path)
+        "entry_price":             signal.get("entry_price", "") if signal.get("entry_price") is not None else "",
+        "stop_loss":               signal.get("stop_loss", "") if signal.get("stop_loss") is not None else "",
+        "target_price":            signal.get("target_price", "") if signal.get("target_price") is not None else "",
+        "invalidation":            signal.get("invalidation_condition", signal.get("invalidation", "")) or "",
         # Outcome columns — filled later by outcome_tracker.py
         "price_1d":                "",
         "price_3d":                "",
@@ -260,7 +268,7 @@ def get_all_signals() -> pd.DataFrame:
     if not bad_versions.empty:
         raise RuntimeError(
             f"{len(bad_versions)} rows have schema_version != {SCHEMA_VERSION}. "
-            "Run `python migrate_schema_v4.py` before reading."
+            "Run `python migrate_schema.py` before reading."
         )
 
     return df

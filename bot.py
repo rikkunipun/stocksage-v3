@@ -16,7 +16,7 @@ from portfolio import fetch_portfolio
 from news_feed import get_news
 from market_data import get_market_news
 from technicals import get_all_technicals
-from analyst import analyze_portfolio
+from analyst import analyze_portfolio_v2
 from nse_calendar import is_market_open, is_trading_day
 from alert_throttle import (
     can_send_alert, record_alert_sent, is_muted as throttle_is_muted,
@@ -78,8 +78,21 @@ def _format_signal_block(signal, technicals):
         f"Reason: {_e(signal['reason'])}",
         f"Event: {_e(signal['event_category'])} | Horizon: {_e(signal['time_horizon'])}",
         f"Price: ₹{_e(price)} | Sector: {_e(sector_name)} @ {_e(sector_price)}",
-        DIVIDER,
     ]
+
+    # v2 actionable levels (item 4) — shown only when present.
+    entry, stop, target = signal.get("entry_price"), signal.get("stop_loss"), signal.get("target_price")
+    if any(v is not None for v in (entry, stop, target)):
+        parts = []
+        if entry  is not None: parts.append(f"Entry ₹{_e(entry)}")
+        if target is not None: parts.append(f"Target ₹{_e(target)}")
+        if stop   is not None: parts.append(f"Stop ₹{_e(stop)}")
+        lines.append(" | ".join(parts))
+    inval = signal.get("invalidation_condition") or signal.get("invalidation")
+    if inval:
+        lines.append(f"❌ Wrong if: {_e(inval)}")
+
+    lines.append(DIVIDER)
     return "\n".join(lines)
 
 
@@ -142,7 +155,7 @@ async def _run_analysis(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label:
         news       = get_market_news() or get_news()   # Marketaux primary, GDELT/NewsAPI fallback
         symbols    = [h["symbol"] for h in holdings]
         technicals = get_all_technicals(symbols)
-        result     = analyze_portfolio(holdings, news, technicals, event_type=event_type)
+        result     = analyze_portfolio_v2(holdings, news, technicals, event_type=event_type)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Analysis failed: {e}")
         return

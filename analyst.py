@@ -4,13 +4,16 @@ import anthropic
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+from typing import List, Optional
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from signal_logger import log_signal
 
 load_dotenv()
 
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL   = "claude-sonnet-4-6"   # v1 path (analyze_portfolio)
+DEEP_MODEL     = "claude-opus-4-8"     # v2 deep-dive (analyze_portfolio_v2)
 
 VALID_ACTIONS = {"BUY", "SELL", "HOLD"}
 VALID_CATEGORIES = {
@@ -401,6 +404,267 @@ def analyze_portfolio(holdings, news, technicals, event_type="on_demand"):
             print(f"WARNING: Failed to shadow-log suppressed SELL for {sym} — {e}")
     data["suppressed_signal_ids"] = suppressed_ids
 
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ITEM 4 — Staged screener + grounded structured deep-dive (Opus 4.8)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SupportingSignals(BaseModel):
+    rsi_14: Optional[float] = None
+    ma20_position: str = "unknown"     # above | below | crossing | unknown
+    ma50_position: str = "unknown"
+    news_sentiment: str = "neutral"    # positive | negative | neutral
+
+
+class DeepSignal(BaseModel):
+    stock_symbol: str
+    action: str                        # BUY | SELL | HOLD
+    reason: str = Field(description="<=180 chars; every claim must trace to provided data")
+    confidence_score: int              # 0-100, honest probability the call is right
+    event_category: str
+    time_horizon: str
+    entry_price: Optional[float] = None      # suggested entry (≈ current for BUY/SELL)
+    stop_loss: Optional[float] = None        # price level that invalidates the thesis
+    target_price: Optional[float] = None
+    invalidation_condition: str = ""         # plain-language "this call is wrong if…"
+    supporting_signals: SupportingSignals = Field(default_factory=SupportingSignals)
+
+
+class DeepSignalReport(BaseModel):
+    signals: List[DeepSignal] = Field(default_factory=list)
+    market_context: str = ""
+    geo_watch: List[str] = Field(default_factory=list)
+
+
+V2_SYSTEM_PROMPT = """You are StockSage, a disciplined NSE (Indian market) analyst.
+You are given a SHORTLIST of pre-screened holdings (already filtered by a rule
+engine) plus grounding data. Analyse only these and return structured signals.
+
+GROUNDING — absolute rules:
+- Cite ONLY facts present in the data provided (technicals, STOCK NEWS, EARNINGS,
+  MARKET NEWS, the stock's OWN SIGNAL HISTORY). If a fact was not given, you do
+  not know it.
+- NEVER invent analyst calls, brokerages, price targets, fundamentals (P/E, ROE,
+  growth, "strong/weak fundamentals"), or news. Name a source only if it appears
+  in the provided headlines. Absence of news = no known news.
+
+DISCIPLINE:
+- Only issue BUY/SELL when the grounding supports a specific, falsifiable thesis.
+  Otherwise HOLD. Max 3 BUY/SELL total; HOLD the rest.
+- If earnings are within 5 days, HOLD (results pending) — do not issue a technical
+  BUY/SELL that a result could invalidate overnight.
+- Consult the stock's SIGNAL HISTORY. If a very similar recent call already failed
+  (e.g. a prior SELL that then rose), do not simply repeat it — either justify why
+  this time differs, using new data, or step down to HOLD.
+- confidence_score is your honest probability the call is right. Do not inflate.
+
+FOR EACH BUY/SELL you MUST provide actionable, falsifiable levels:
+- entry_price: sensible entry (≈ current price).
+- stop_loss: the price level at which the thesis is wrong (invalidation).
+- target_price: realistic objective over the stated horizon.
+- invalidation_condition: one plain-language sentence — the concrete event/level
+  that would prove the call wrong (e.g. "wrong if it closes below 1180 or Q1 EPS
+  misses"). For HOLD, levels may be null but still state what would change your mind.
+"""
+
+
+def _fmt_history(hist):
+    if not hist:
+        return "    (no prior signals on this stock)"
+    out = []
+    for h in hist:
+        out.append(f"    {h['date']} {h['action']} conf={h['confidence']} "
+                   f"ret5d={h['return_5d']} ret20d={h['return_20d']}")
+    return "\n".join(out)
+
+
+def _build_v2_prompt(candidates, holdings_by_sym, technicals, stock_news, earnings,
+                     market_news, histories):
+    lines = ["=== SHORTLISTED CANDIDATES (analyse only these) ===\n"]
+    for c in candidates:
+        sym = c.symbol
+        h = holdings_by_sym.get(sym, {})
+        t = technicals.get(sym, {})
+        e = earnings.get(sym, {})
+        lines.append(f"── {sym}  (screener: {', '.join(c.flags)}; hint={c.direction_hint}) ──")
+        lines.append(f"  position: qty={h.get('quantity','?')} avg={h.get('avg_buy_price','?')} "
+                     f"cmp={h.get('current_price','?')} pnl={h.get('pnl_percent','?')}%")
+        lines.append(f"  technicals: price={t.get('current_price','N/A')} RSI={t.get('rsi_14','N/A')} "
+                     f"MA20={t.get('ma20','N/A')}({t.get('ma20_position','?')}) "
+                     f"MA50={t.get('ma50','N/A')}({t.get('ma50_position','?')}) "
+                     f"sector={t.get('sector_index_name','?')}@{t.get('sector_index_price','N/A')}")
+        if e and e.get("source") != "none" and e.get("next_earnings"):
+            lines.append(f"  earnings: {e['next_earnings']} (in {e['days_until']}d)"
+                         + ("  <-- WITHIN 5 DAYS: HOLD" if (e.get('days_until') is not None and e['days_until'] <= 5) else ""))
+        else:
+            lines.append("  earnings: unknown (treat as unknown, do not assume)")
+        news = stock_news.get(sym) or []
+        if news:
+            lines.append("  news:")
+            for n in news[:3]:
+                sent = n.get("sentiment")
+                ss = f", sent={sent:+.2f}" if isinstance(sent,(int,float)) else ""
+                lines.append(f"    - {n['title']} ({n.get('source','?')}, {n.get('published_at','')[:10]}{ss})")
+        else:
+            lines.append("  news: none retrieved (treat as no known news)")
+        lines.append("  signal history (this stock's past calls + outcomes):")
+        lines.append(_fmt_history(histories.get(sym)))
+        lines.append("")
+
+    lines.append("=== MARKET / MACRO NEWS ===")
+    if market_news:
+        for i, n in enumerate(market_news[:6], 1):
+            lines.append(f"[{i}] {n['title']} ({n.get('source','?')}, {n.get('published_at','')[:10]})")
+    else:
+        lines.append("No market headlines this run — do not invent any.")
+
+    lines.append("\nReturn structured signals for the candidates above, per your rules. "
+                 "Every 'reason' must trace to a line above; provide entry/stop/target/"
+                 "invalidation for each BUY/SELL.")
+    return "\n".join(lines)
+
+
+def _call_opus_structured(user_prompt):
+    """
+    Opus 4.8 structured deep-dive. Prefers messages.parse(output_format=...);
+    falls back to messages.create + manual JSON validation if parse is
+    unavailable on the installed SDK. Returns a DeepSignalReport or None.
+    """
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    try:
+        resp = client.messages.parse(
+            model=DEEP_MODEL,
+            max_tokens=3072,
+            system=V2_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+            output_format=DeepSignalReport,
+        )
+        if getattr(resp, "parsed_output", None) is not None:
+            return resp.parsed_output
+        # refusal or unparsed — fall through to text parse
+        text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
+        return DeepSignalReport(**_parse_response(text))
+    except Exception as e:
+        print(f"WARNING: structured parse failed ({e}) — falling back to plain call")
+        try:
+            msg = client.messages.create(
+                model=DEEP_MODEL, max_tokens=3072,
+                system=V2_SYSTEM_PROMPT + "\n\nReturn ONLY a JSON object matching the schema.",
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            return DeepSignalReport(**_parse_response(msg.content[0].text.strip()))
+        except Exception as e2:
+            print(f"ERROR: Opus deep-dive failed — {e2}")
+            return None
+
+
+def analyze_portfolio_v2(holdings, market_news, technicals, event_type="on_demand"):
+    """
+    Item-4 pipeline: screen -> fetch grounding for candidates -> Opus 4.8
+    structured deep-dive -> Python rule layer -> log. Returns a dict shaped like
+    analyze_portfolio's output (signals/market_context/geo_watch/signal_ids) so
+    build_signal_message works unchanged.
+    """
+    if not CLAUDE_API_KEY:
+        return _fallback("CLAUDE_API_KEY missing")
+    if not holdings:
+        return _fallback("no holdings returned by Angel One")
+
+    from screener import screen
+    from signal_logger import get_signal_history
+
+    candidates = screen(holdings, technicals or {})
+    if not candidates:
+        return {"signals": [], "market_context": "No candidates cleared the screener today.",
+                "geo_watch": [], "signal_ids": [], "suppressed_signal_ids": []}
+
+    cand_syms = [c.symbol for c in candidates]
+    holdings_by_sym = {h["symbol"].split("-")[0]: h for h in holdings}
+
+    # Grounding for candidates ONLY (fewer API calls than the whole portfolio).
+    stock_news, earnings, histories = {}, {}, {}
+    try:
+        from market_data import get_stock_news, get_earnings_calendar
+        for s in cand_syms:
+            stock_news[s] = get_stock_news(s)
+            earnings[s]   = get_earnings_calendar(s)
+            histories[s]  = get_signal_history(s)
+    except Exception as e:
+        print(f"WARNING: v2 grounding fetch failed — {e}")
+        for s in cand_syms:
+            histories.setdefault(s, get_signal_history(s))
+
+    prompt = _build_v2_prompt(candidates, holdings_by_sym, technicals or {},
+                              stock_news, earnings, market_news or [], histories)
+
+    report = _call_opus_structured(prompt)
+    if report is None:
+        return _fallback("Opus deep-dive returned nothing")
+
+    portfolio_symbols = set(cand_syms) | {h["symbol"].split("-")[0] for h in holdings}
+    valid, suppressed, buy_sell = [], [], 0
+
+    for sig in report.signals:
+        d = sig.model_dump()
+        sym = d.get("stock_symbol", "")
+        if sym not in portfolio_symbols or d.get("action") not in VALID_ACTIONS:
+            print(f"WARNING: dropped v2 signal {sym}/{d.get('action')}")
+            continue
+        if not isinstance(d.get("confidence_score"), int) or not (0 <= d["confidence_score"] <= 100):
+            continue
+        if d.get("event_category") not in VALID_CATEGORIES:
+            d["event_category"] = "no_catalyst"
+
+        # Interim policy: suppress technical_only SELLs (shadow-log for calibration).
+        if d["action"] == "SELL" and d["event_category"] == "technical_only":
+            suppressed.append(dict(d))
+            print(f"[Interim Filter] Demoting technical_only SELL → HOLD for {sym}")
+            d["action"] = "HOLD"
+            d["reason"] = f"SELL suppressed pending validation — {d['reason']}"[:180]
+
+        if d["action"] in ("BUY", "SELL"):
+            if buy_sell >= 3:
+                d["action"] = "HOLD"
+            else:
+                buy_sell += 1
+
+        d["confidence_label"] = format_confidence_label(d["confidence_score"])
+        valid.append(d)
+
+    data = {"signals": valid,
+            "market_context": report.market_context,
+            "geo_watch": report.geo_watch}
+
+    signal_ids = []
+    for d in valid:
+        if d["action"] in ("BUY", "SELL"):
+            sym = d["stock_symbol"]; tech = (technicals or {}).get(sym, {})
+            try:
+                sid = log_signal(signal=d, technicals=technicals or {},
+                                 nifty_price=tech.get("nifty50_price"),
+                                 sector_price=tech.get("sector_index_price"),
+                                 sector_name=tech.get("sector_index_name", ""),
+                                 headlines=stock_news.get(sym, []), event_type=event_type)
+                signal_ids.append(sid)
+            except Exception as e:
+                print(f"WARNING: failed to log v2 signal {sym} — {e}")
+    data["signal_ids"] = signal_ids
+
+    suppressed_ids = []
+    for d in suppressed:
+        sym = d["stock_symbol"]; tech = (technicals or {}).get(sym, {})
+        try:
+            sid = log_signal(signal=d, technicals=technicals or {},
+                             nifty_price=tech.get("nifty50_price"),
+                             sector_price=tech.get("sector_index_price"),
+                             sector_name=tech.get("sector_index_name", ""),
+                             headlines=stock_news.get(sym, []), event_type="suppressed")
+            suppressed_ids.append(sid)
+        except Exception as e:
+            print(f"WARNING: failed to shadow-log suppressed v2 SELL {sym} — {e}")
+    data["suppressed_signal_ids"] = suppressed_ids
     return data
 
 

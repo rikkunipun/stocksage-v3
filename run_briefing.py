@@ -36,7 +36,7 @@ async def main(dry_run=False):
     from news_feed import get_news
     from market_data import get_market_news
     from technicals import get_all_technicals
-    from analyst import analyze_portfolio
+    from analyst import analyze_portfolio_v2
     from bot import build_signal_message
     from briefing_sender import send_message_http, send_error_alert
 
@@ -45,7 +45,7 @@ async def main(dry_run=False):
         holdings   = fetch_portfolio()
         news       = get_market_news() or get_news()   # Marketaux primary, GDELT/NewsAPI fallback
         technicals = get_all_technicals([h["symbol"] for h in holdings])
-        result     = analyze_portfolio(holdings, news, technicals, event_type="morning_briefing")
+        result     = analyze_portfolio_v2(holdings, news, technicals, event_type="morning_briefing")
         message    = build_signal_message(result, technicals) + _tracker_staleness_warning()
     except Exception as e:
         log.error("Pipeline failed:\n" + traceback.format_exc())
