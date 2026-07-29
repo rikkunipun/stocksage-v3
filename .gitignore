@@ -5,3 +5,12 @@ __pycache__/
 .DS_Store
 *.log
 .claude/
+
+# Live datastore — must NOT be tracked. A tracked data/ was the root cause of
+# the Jul 2026 clobber: a full-dir rsync pushed a stale committed CSV over the
+# live server file. Keep runtime data out of the repo entirely.
+data/*.csv
+data/*.json
+data/backups/
+data/failsafe.jsonl
+venv/
