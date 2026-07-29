@@ -282,6 +282,39 @@ def get_pending_tracking() -> pd.DataFrame:
     return df[mask].reset_index(drop=True)
 
 
+def get_signal_history(symbol: str, limit: int = 5) -> list:
+    """
+    Return the most recent past signals for `symbol` with their realized
+    outcomes, so the deep-dive call can see its own track record and avoid
+    re-issuing a thesis that already failed (e.g. the repeated DUMMY_B SELL).
+    Excludes suppressed/test rows. Newest first.
+    """
+    base = symbol.split("-")[0].upper()
+    try:
+        df = get_all_signals()
+        if df.empty:
+            return []
+        sub = df[(df["stock_symbol"].str.upper() == base) &
+                 (df["action"].isin(["BUY", "SELL"])) &
+                 (~df["event_type"].isin(["suppressed", "test"]))].copy()
+        if sub.empty:
+            return []
+        sub = sub.sort_values("timestamp", ascending=False).head(limit)
+        out = []
+        for _, r in sub.iterrows():
+            out.append({
+                "date":       str(r["timestamp"])[:10],
+                "action":     r["action"],
+                "confidence": r.get("confidence_score", ""),
+                "return_5d":  r.get("return_5d_pct", ""),
+                "return_20d": r.get("return_20d_pct", ""),
+            })
+        return out
+    except Exception as e:
+        print(f"WARNING: get_signal_history({symbol}) failed — {e}")
+        return []
+
+
 def create_daily_backup() -> str:
     """
     Copy signals_log.csv to data/backups/signals_log_YYYYMMDD.csv.
