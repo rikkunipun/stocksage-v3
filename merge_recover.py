@@ -52,11 +52,21 @@ def main():
     ap.add_argument("--recovered", required=True)
     ap.add_argument("--live", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--drop-tests", action="store_true",
+                    help="Exclude event_type=test rows from the merge.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     recovered = _load(args.recovered)
     live = _load(args.live)
+
+    if args.drop_tests:
+        dropped = [sid for sid, r in list(recovered.items()) if r.get("event_type") == "test"]
+        dropped += [sid for sid, r in list(live.items()) if r.get("event_type") == "test"]
+        for sid in set(dropped):
+            recovered.pop(sid, None)
+            live.pop(sid, None)
+        print(f"[--drop-tests] excluded {len(set(dropped))} test row(s): {sorted(set(dropped))}\n")
 
     all_ids = set(recovered) | set(live)
     both = set(recovered) & set(live)
