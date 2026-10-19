@@ -112,19 +112,19 @@ def main():
     holdings = [
         {"symbol": "DUMMY_A-EQ",   "pnl_percent": -45.0},
         {"symbol": "DUMMY_B-EQ",  "pnl_percent": +60.0},
-        {"symbol": "TCS-EQ",     "pnl_percent": +2.0},
-        {"symbol": "ITC-EQ",     "pnl_percent": +5.0},
-        {"symbol": "NHPC-EQ",    "pnl_percent": +1.0},
+        {"symbol": "DUMMY_C-EQ",     "pnl_percent": +2.0},
+        {"symbol": "DUMMY_D-EQ",     "pnl_percent": +5.0},
+        {"symbol": "DUMMY_E-EQ",    "pnl_percent": +1.0},
     ]
     tech = {
         "DUMMY_A":  {"rsi_14": 33, "ma20_position": "below", "ma50_position": "below", "current_price": 154, "ma20": 170},
         "DUMMY_B": {"rsi_14": 82, "ma20_position": "above", "ma50_position": "above", "current_price": 116, "ma20": 100},
-        "TCS":    {"rsi_14": 51, "ma20_position": "above", "ma50_position": "above", "current_price": 4100, "ma20": 4080},
-        "ITC":    {"rsi_14": 55, "ma20_position": "crossing", "ma50_position": "above", "current_price": 450, "ma20": 449},
-        "NHPC":   {"rsi_14": 49, "ma20_position": "above", "ma50_position": "above", "current_price": 95, "ma20": 94},
+        "DUMMY_C":    {"rsi_14": 51, "ma20_position": "above", "ma50_position": "above", "current_price": 4100, "ma20": 4080},
+        "DUMMY_D":    {"rsi_14": 55, "ma20_position": "crossing", "ma50_position": "above", "current_price": 450, "ma20": 449},
+        "DUMMY_E":   {"rsi_14": 49, "ma20_position": "above", "ma50_position": "above", "current_price": 95, "ma20": 94},
     }
-    earn = {"ITC": {"next_earnings": "2026-08-01", "days_until": 2, "source": "yfinance"}}
-    news = {"NHPC": [{"title": "Sikkim tunnel collapse hits NHPC project", "sentiment": -0.5, "source": "mint"}]}
+    earn = {"DUMMY_D": {"next_earnings": "2026-08-01", "days_until": 2, "source": "yfinance"}}
+    news = {"DUMMY_E": [{"title": "Sikkim tunnel collapse hits DUMMY_E project", "sentiment": -0.5, "source": "mint"}]}
 
     print(f"{'SYM':<8} {'SCORE':>5}  {'HINT':<8} FLAGS")
     for c in screen(holdings, tech, earn, news):

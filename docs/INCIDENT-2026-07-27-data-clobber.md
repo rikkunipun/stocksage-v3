@@ -8,7 +8,7 @@
 On **2026-07-27**, the live signal log (`data/signals_log.csv`) on the Oracle
 server was overwritten with a stale copy, dropping every signal from
 **2026-05-22 through 2026-07-26** — 40 delivered signals, including the
-`sig_20260722_0830_DUMMY_F` BUY. The loss was discovered on 2026-07-29 while
+a BUY on one holding. The loss was discovered on 2026-07-29 while
 pulling the file for calibration analysis: the file had a two-month hole
 (rows jumped May 21 → July 27) and the missing signals were in no backup.
 
@@ -48,7 +48,7 @@ containing all 151 rows through the clobber moment. Recovery:
 2. Current live file backed up server-side and locally first
    (`signals_log_pre_recovery_<ts>.csv`).
 3. Merged file pushed to the server; `run_tracking.py` backfilled outcomes for
-   the restored rows. Verified: 0 stale gaps, DUMMY_F present with its
+   the restored rows. Verified: 0 stale gaps, a holding present with its
    outcomes, no duplicate IDs.
 
 Net: no data permanently lost.
