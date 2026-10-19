@@ -27,7 +27,7 @@ He needed a short list of what to act on and why, waiting for him before the mar
 
 ## How it works
 
-- `agent_core.py`: startup checks and the scheduler for the morning briefing, geo alerts, daily backup and outcome tracking.
+- `agent_core.py`: older all-in-one scheduler. Retired; its jobs now live in `bot.py` and cron.
 - `run_briefing.py`: builds and sends the morning briefing (supports a dry run).
 - `bot.py`: the Telegram bot, with its commands, the signal message format and the geo-alert loop.
 - `analyst.py`: calls Claude to produce signals, validates them, and applies the catalyst allowlist and Nifty trend filter.
@@ -64,9 +64,14 @@ He needed a short list of what to act on and why, waiting for him before the mar
    pip install -r requirements.txt
    ```
 3. Create a `.env` file based on `.env.example` and fill in your API keys (not included)
-4. Run the bot:
+4. Run the bot (the long-running process that answers Telegram commands and sends geo alerts):
    ```bash
-   python agent_core.py
+   python bot.py
+   ```
+5. Schedule the daily jobs with cron (the 8:30 AM IST briefing runs on a weekday cron, outcome tracking after market close):
+   ```bash
+   python run_briefing.py
+   python run_tracking.py
    ```
 
 ## Environment Variables
